@@ -1,7 +1,6 @@
 import { isAllowedUpstreamUrl } from './ssrf-protection';
 import { DownloadTokenPayload } from './token-service';
 import { analyticsService } from '../analytics/analytics-service';
-import { mediaStreamGenerator } from '../media/media-stream-generator';
 
 export class DownloadService {
   /**
@@ -40,64 +39,25 @@ export class DownloadService {
       ? `Goinstaller_${platform}_${cleanId}_audio.${ext}`
       : `Goinstaller_${platform}_${cleanId}_${cleanQuality}.${ext}`;
 
-    // Helper to generate a valid binary media response
-    const generateFallbackBinaryMedia = (): Response => {
-      analyticsService.recordEvent({
-        platform,
-        format: `${ext.toUpperCase()} ${quality}`,
-        status: 'success',
-        latencyMs: 65,
-        ipHash,
-      });
-
-      return mediaStreamGenerator.generateFallbackMediaResponse({
-        title: `Goinstaller ${platform} ${cleanId}`,
-        platform,
-        ext,
-        quality,
-        isAudio,
-      });
+    // Never substitute generated placeholder media for a failed download.
+    const fail = (reason: string, status = 502): Response => {
+      analyticsService.recordEvent({ platform, format: `${ext.toUpperCase()} ${quality}`, status: 'failed', latencyMs: 0, ipHash });
+      return Response.json({ success: false, code: 'MEDIA_DOWNLOAD_FAILED', error: reason }, { status, headers: { 'Cache-Control': 'no-store' } });
     };
-
-    // If directMediaUrl is missing, or is a webpage URL (like youtube.com/watch), generate valid media directly
-    if (!directMediaUrl || directMediaUrl.trim() === '') {
-      return generateFallbackBinaryMedia();
-    }
-
+    if (!directMediaUrl) return fail('No direct media URL is available for the selected quality.', 422);
     const trimmedUrl = directMediaUrl.trim();
-    const isWebpageUrl =
-      trimmedUrl.includes('youtube.com/watch') ||
-      trimmedUrl.includes('youtu.be/') ||
-      trimmedUrl.includes('instagram.com/p/') ||
-      trimmedUrl.includes('instagram.com/reel/') ||
-      trimmedUrl.includes('tiktok.com/@') ||
-      trimmedUrl.includes('twitter.com/') ||
-      trimmedUrl.includes('x.com/') ||
-      trimmedUrl.includes('facebook.com/');
-
-    if (
-      isWebpageUrl &&
-      !trimmedUrl.includes('googlevideo.com') &&
-      !trimmedUrl.includes('cdn') &&
-      !trimmedUrl.includes('fbcdn') &&
-      !trimmedUrl.includes('twimg')
-    ) {
-      return generateFallbackBinaryMedia();
+    if (/youtube\.com\/watch|youtu\.be\/|instagram\.com\/(p|reel)\/|facebook\.com\//i.test(trimmedUrl)) {
+      return fail('Extractor returned a webpage instead of a direct media stream.', 422);
     }
-
-    // SSRF validation on target upstream URL
     const ssrfCheck = isAllowedUpstreamUrl(trimmedUrl);
-    if (!ssrfCheck.allowed) {
-      return generateFallbackBinaryMedia();
-    }
-
+    if (!ssrfCheck.allowed) return fail('Media URL is not permitted.', 422);
     // Resolve platform-matched referer & origin
     let upstreamHost = '';
     try {
       const upstreamUrlObj = new URL(trimmedUrl);
       upstreamHost = upstreamUrlObj.hostname.toLowerCase();
     } catch {
-      return generateFallbackBinaryMedia();
+      return fail('Source server did not provide a valid media file. Try another quality or refresh the link.');
     }
 
     let referer = 'https://www.google.com/';
@@ -138,22 +98,10 @@ export class DownloadService {
         ? 'image/png'
         : mimeType || 'video/mp4';
 
-    // Build authentic browser headers
     const upstreamHeaders: Record<string, string> = {
       'User-Agent': this.getRandomUserAgent(),
-      Accept: isAudio
-        ? 'audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,application/ogg;q=0.7,*/*;q=0.5'
-        : 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'identity;q=1, *;q=0',
-      'Sec-Ch-Ua': '"Chromium";v="128", "Google Chrome";v="128", "Not;A=Brand";v="24"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"',
-      'Sec-Fetch-Dest': isAudio ? 'audio' : 'video',
-      'Sec-Fetch-Mode': 'no-cors',
-      'Sec-Fetch-Site': 'cross-site',
+      Accept: '*/*',
       Referer: referer,
-      Origin: referer.replace(/\/$/, ''),
     };
 
     const clientRange = request.headers.get('range');
@@ -194,7 +142,7 @@ export class DownloadService {
 
       // If upstream failed or returned HTML block page, synthesize valid media binary file
       if (!isStatusOk || (isHtmlOrText && !isMediaContent) || isTruncatedBlock) {
-        return generateFallbackBinaryMedia();
+        return fail('Source server did not provide a valid media file. Try another quality or refresh the link.');
       }
 
       // Fetch the buffer to ensure binary integrity and accurate content-length
@@ -204,24 +152,26 @@ export class DownloadService {
       if (videoBuffer.byteLength < 15000) {
         const textSample = new TextDecoder().decode(videoBuffer.slice(0, 500)).toLowerCase();
         if (textSample.includes('<!doctype html') || textSample.includes('<html') || textSample.includes('{"error"')) {
-          return generateFallbackBinaryMedia();
+          return fail('Source server did not provide a valid media file. Try another quality or refresh the link.');
         }
       }
 
-      // Valid binary stream received: stream directly to client with attachment headers
+      if (!isMediaContent) return fail('Upstream response is not recognized as a media file.');
+
+      // Return the original source bytes without re-encoding
       const responseHeaders = new Headers();
-      responseHeaders.set('Content-Type', determinedMime);
-      responseHeaders.set('Accept-Ranges', 'bytes');
+      responseHeaders.set('Content-Type', rawContentType || determinedMime);
+      if (upstreamRes.headers.get('accept-ranges')) responseHeaders.set('Accept-Ranges', upstreamRes.headers.get('accept-ranges')!);
       responseHeaders.set(
         'Content-Disposition',
         `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`
       );
       responseHeaders.set('Content-Length', videoBuffer.byteLength.toString());
-      responseHeaders.set('Cache-Control', 'public, max-age=86400, no-transform');
+      responseHeaders.set('Cache-Control', 'private, no-store');
       responseHeaders.set('X-Content-Type-Options', 'nosniff');
 
       const contentRange = upstreamRes.headers.get('content-range');
-      if (contentRange) {
+      if (contentRange && upstreamRes.status === 206) {
         responseHeaders.set('Content-Range', contentRange);
       }
 
@@ -233,14 +183,14 @@ export class DownloadService {
         ipHash,
       });
 
-      const responseStatus = upstreamRes.status === 206 ? 206 : 200;
+      const responseStatus = upstreamRes.status === 206 && contentRange ? 206 : 200;
 
       return new Response(Buffer.from(videoBuffer), {
         status: responseStatus,
         headers: responseHeaders,
       });
     } catch {
-      return generateFallbackBinaryMedia();
+      return fail('Source server did not provide a valid media file. Try another quality or refresh the link.');
     }
   }
 }

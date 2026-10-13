@@ -3,7 +3,6 @@ import { downloadService } from '@/services/download/download-service';
 import { tokenService, DownloadTokenPayload } from '@/services/download/token-service';
 import { rateLimiter } from '@/services/rate-limit/rate-limiter';
 import { mediaCache } from '@/services/cache/media-cache';
-import { mediaStreamGenerator } from '@/services/media/media-stream-generator';
 
 export async function GET(req: NextRequest) {
   const searchParams = req.nextUrl.searchParams;
@@ -24,25 +23,10 @@ export async function GET(req: NextRequest) {
     // Case 1: Token-based verified stream request
     if (token) {
       const verified = tokenService.verifyToken(token);
-      let payload: DownloadTokenPayload | null = verified.valid ? verified.payload || null : null;
-
-      // Soft fallback decode if signature check had any discrepancy
-      if (!payload) {
-        payload = tokenService.decodePayloadWithoutVerification(token);
-      }
+      const payload: DownloadTokenPayload | null = verified.valid ? verified.payload || null : null;
+      if (!payload) return NextResponse.json({ success: false, error: 'Invalid or expired download token.' }, { status: 401 });
 
       if (payload) {
-        // If client explicitly requested direct redirect mode
-        if (mode === 'redirect' && payload.directMediaUrl && !payload.directMediaUrl.includes('youtube.com/watch')) {
-          return NextResponse.redirect(payload.directMediaUrl, {
-            status: 307,
-            headers: {
-              'Content-Disposition': `attachment; filename="Goinstaller_${payload.platform}_${payload.mediaId}.${payload.ext}"`,
-              'Cache-Control': 'no-store, no-cache, must-revalidate',
-            },
-          });
-        }
-
         return await downloadService.streamMediaResponse(req, payload, ipHash);
       }
     }
@@ -50,12 +34,12 @@ export async function GET(req: NextRequest) {
     // Case 2: Direct media ID + platform request
     const cached = mediaCache.get(platform as any, id);
     if (cached && cached.formats && cached.formats.length > 0) {
-      const matchedFormat =
-        cached.formats.find(
-          (f) =>
-            f.ext === format &&
-            (f.resolution?.includes(res) || f.quality?.includes(res) || f.bitrate?.includes(bitrate))
-        ) || cached.formats[0];
+      const matchedFormat = cached.formats.find((f) =>
+        f.ext === format && (isAudio
+          ? (f.bitrate?.includes(bitrate) || f.quality?.includes(bitrate))
+          : (f.resolution?.includes(res) || f.quality?.includes(res)))
+      );
+      if (!matchedFormat) return NextResponse.json({ success: false, error: 'Requested format or quality is unavailable.' }, { status: 422 });
 
       const directUrl = (matchedFormat as any)?.directStreamUrl || (matchedFormat as any)?.streamUrl;
       const payload: DownloadTokenPayload = {
@@ -72,21 +56,9 @@ export async function GET(req: NextRequest) {
       return await downloadService.streamMediaResponse(req, payload, ipHash);
     }
 
-    // Fallback: Always return a genuine valid playable media file so the user never gets a 10KB JSON error file
-    return mediaStreamGenerator.generateFallbackMediaResponse({
-      title: `Goinstaller ${platform} ${id}`,
-      platform,
-      ext: format,
-      quality: `${res}p`,
-      isAudio,
-    });
-  } catch {
-    return mediaStreamGenerator.generateFallbackMediaResponse({
-      title: `Goinstaller ${platform} ${id}`,
-      platform,
-      ext: format,
-      quality: `${res}p`,
-      isAudio,
-    });
+    return NextResponse.json({ success: false, error: 'Media link expired or media was not found. Please resolve the URL again.' }, { status: 404 });
+  } catch (error) {
+    console.error('[DOWNLOAD_ERROR]', error);
+    return NextResponse.json({ success: false, error: 'Download failed. Please retry.' }, { status: 502 });
   }
 }
