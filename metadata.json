@@ -1,0 +1,7 @@
+{
+  "name": "Goinstaller.com",
+  "description": "Goinstaller.com - High-speed multi-platform video and audio downloader. Download MP4 and MP3 from YouTube, Facebook, Instagram, TikTok, Twitter/X, and Vimeo in high quality.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
